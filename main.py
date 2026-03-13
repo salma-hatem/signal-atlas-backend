@@ -490,28 +490,6 @@ def get_devices(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@app.get("/api/readings/latest", response_model=Optional[DeviceReadingResponse])
-def get_latest_reading(
-    device_id: str = Query(..., min_length=1),
-    db: Session = Depends(get_db),
-    _: str = Depends(verify_api_key),
-):
-    """Return the latest reading for one device (`source`)."""
-    try:
-        reading = (
-            db.query(DeviceReading)
-            .filter(DeviceReading.source == device_id)
-            .order_by(DeviceReading.timestamp.desc(), DeviceReading.id.desc())
-            .first()
-        )
-        if not reading:
-            return None
-        return _device_reading_to_response(reading)
-    except Exception as e:
-        logger.error(f"Latest reading error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
 @app.get("/api/readings/history", response_model=List[DeviceReadingResponse])
 def get_device_reading_history(
     device_id: str = Query(..., min_length=1),
