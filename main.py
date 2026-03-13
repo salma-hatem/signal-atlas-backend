@@ -191,6 +191,49 @@ class TrendsResponse(BaseModel):
     points: List[TrendPoint]
 
 
+class FiltersResponse(BaseModel):
+    operators: List[str]
+
+
+class DeviceSummaryResponse(BaseModel):
+    device_id: str
+    reading_count: int
+    last_reading: Optional[str]
+
+
+class DeviceReadingResponse(BaseModel):
+    device_id: str
+    timestamp: str
+    latitude: Optional[float]
+    longitude: Optional[float]
+    altitude: Optional[float]
+    level: Optional[int]
+    asu: Optional[int]
+    rsrp: Optional[int]
+    rssi: Optional[int]
+    rsrq: Optional[int]
+    network_type: Optional[str]
+    operator: Optional[str]
+    cell_id: Optional[str]
+    physical_cell_id: Optional[int]
+    tracking_area_code: Optional[int]
+    country: Optional[str]
+    city: Optional[str]
+    created_at: str
+
+
+class DeviceLocationPoint(BaseModel):
+    device_id: str
+    latitude: float
+    longitude: float
+    rsrp: Optional[int]
+    rsrq: Optional[int]
+    level: Optional[int]
+    operator: Optional[str]
+    network_type: Optional[str]
+    timestamp: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -412,6 +455,142 @@ def create_batch_network_data(
 
 
 # ---------------------------------------------------------------------------
+# Device read endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/devices", response_model=List[DeviceSummaryResponse])
+def get_devices(
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """Return all distinct device IDs (`source`) with reading count and latest timestamp."""
+    try:
+        rows = (
+            db.query(
+                DeviceReading.source.label("device_id"),
+                func.count(DeviceReading.id).label("reading_count"),
+                func.max(DeviceReading.timestamp).label("last_reading"),
+            )
+            .filter(DeviceReading.source.isnot(None))
+            .group_by(DeviceReading.source)
+            .order_by(DeviceReading.source)
+            .all()
+        )
+
+        return [
+            DeviceSummaryResponse(
+                device_id=row.device_id,
+                reading_count=row.reading_count or 0,
+                last_reading=row.last_reading.isoformat() if row.last_reading else None,
+            )
+            for row in rows
+        ]
+    except Exception as e:
+        logger.error(f"Devices error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/api/readings/latest", response_model=Optional[DeviceReadingResponse])
+def get_latest_reading(
+    device_id: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """Return the latest reading for one device (`source`)."""
+    try:
+        reading = (
+            db.query(DeviceReading)
+            .filter(DeviceReading.source == device_id)
+            .order_by(DeviceReading.timestamp.desc(), DeviceReading.id.desc())
+            .first()
+        )
+        if not reading:
+            return None
+        return _device_reading_to_response(reading)
+    except Exception as e:
+        logger.error(f"Latest reading error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/api/readings/history", response_model=List[DeviceReadingResponse])
+def get_device_reading_history(
+    device_id: str = Query(..., min_length=1),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """Return recent readings for one device (`source`)."""
+    try:
+        rows = (
+            db.query(DeviceReading)
+            .filter(DeviceReading.source == device_id)
+            .order_by(DeviceReading.timestamp.desc(), DeviceReading.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [_device_reading_to_response(row) for row in reversed(rows)]
+    except Exception as e:
+        logger.error(f"History error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/api/readings/locations", response_model=List[DeviceLocationPoint])
+def get_device_locations(
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """Return the latest geo-located reading for each device."""
+    try:
+        latest_subquery = (
+            db.query(
+                DeviceReading.source.label("device_id"),
+                func.max(DeviceReading.timestamp).label("max_timestamp"),
+            )
+            .filter(
+                DeviceReading.source.isnot(None),
+                DeviceReading.latitude.isnot(None),
+                DeviceReading.longitude.isnot(None),
+            )
+            .group_by(DeviceReading.source)
+            .subquery()
+        )
+
+        rows = (
+            db.query(DeviceReading)
+            .join(
+                latest_subquery,
+                (DeviceReading.source == latest_subquery.c.device_id)
+                & (DeviceReading.timestamp == latest_subquery.c.max_timestamp),
+            )
+            .order_by(DeviceReading.source)
+            .all()
+        )
+
+        deduped = {}
+        for row in rows:
+            deduped[row.source] = row
+
+        return [
+            DeviceLocationPoint(
+                device_id=row.source,
+                latitude=row.latitude,
+                longitude=row.longitude,
+                rsrp=row.rsrp,
+                rsrq=row.rsrq,
+                level=row.level,
+                operator=row.operator,
+                network_type=row.network_type,
+                timestamp=row.timestamp.isoformat(),
+            )
+            for row in deduped.values()
+            if row.latitude is not None and row.longitude is not None
+        ]
+    except Exception as e:
+        logger.error(f"Locations error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
 # Query endpoints (legacy / admin)
 # ---------------------------------------------------------------------------
 
@@ -589,6 +768,26 @@ def mobile_trends(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.get("/api/mobile/operators/unique", response_model=FiltersResponse)
+def mobile_filters(
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """Return all unique non-null operator values stored in the database."""
+    try:
+        rows = (
+            db.query(DeviceReading.operator)
+            .filter(DeviceReading.operator.isnot(None))
+            .distinct()
+            .order_by(DeviceReading.operator)
+            .all()
+        )
+        return FiltersResponse(operators=[r.operator for r in rows if r.operator])
+    except Exception as e:
+        logger.error(f"Operators error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -627,6 +826,29 @@ def _reading_to_response(r: DeviceReading) -> NetworkDataResponse:
     return NetworkDataResponse(
         id=r.id,
         source=r.source,
+        timestamp=r.timestamp.isoformat(),
+        latitude=r.latitude,
+        longitude=r.longitude,
+        altitude=r.altitude,
+        level=r.level,
+        asu=r.asu,
+        rsrp=r.rsrp,
+        rssi=r.rssi,
+        rsrq=r.rsrq,
+        network_type=r.network_type,
+        operator=r.operator,
+        cell_id=r.cell_id,
+        physical_cell_id=r.physical_cell_id,
+        tracking_area_code=r.tracking_area_code,
+        country=r.country,
+        city=r.city,
+        created_at=r.created_at.isoformat(),
+    )
+
+
+def _device_reading_to_response(r: DeviceReading) -> DeviceReadingResponse:
+    return DeviceReadingResponse(
+        device_id=r.source,
         timestamp=r.timestamp.isoformat(),
         latitude=r.latitude,
         longitude=r.longitude,
